@@ -1,0 +1,326 @@
+# --------------------------------------------------------------------------- #
+# LoRaWAN / ChirpStack identifiers — single source of truth.
+# Referenced below as ${app_id}, ${dev_eui}, ${join_eui}, ${app_key},
+# --------------------------------------------------------------------------- #
+substitutions:
+  app_id:   !secret app_id
+  dev_eui:  !secret dev_eui
+  join_eui: !secret join_eui
+  app_key:  !secret app_key
+  name: "lolin32-lorawan-01"
+  friendly_name: "lolin32-lorawan-01"
+  
+esphome:
+  name: ${name}
+  friendly_name: ${friendly_name}
+  on_boot:
+    # Run after all components are set up.  Apply restored switch states,
+    # publish HA discovery for the remote-control buttons (once API is up),
+    # wait for sensors to settle, then trigger one LoRaWAN cycle.
+    priority: -100
+    then:
+      - lambda: |-
+          ESP_LOGI("on_boot", "start — wifi_enabled=%s  deep_sleep_enabled=%s",
+                   id(wifi_enabled).state ? "ON" : "OFF",
+                   id(deep_sleep_enabled).state ? "ON" : "OFF");
+      - if:
+          condition:
+            switch.is_off: deep_sleep_enabled
+          then:
+            - deep_sleep.prevent: ds
+
+      # Try to publish HA MQTT discovery on EVERY boot, regardless of
+      # wifi_enabled — discovery is retained on the broker and idempotent.
+      # We wait briefly for MQTT to come up; if it doesn't, we skip and the
+      # already-retained discovery on the broker keeps HA happy.
+      - logger.log: "on_boot: waiting up to 15s for MQTT to publish discovery"
+      - wait_until:
+          condition:
+            mqtt.connected:
+          timeout: 15s
+      - if:
+          condition:
+            mqtt.connected:
+          then:
+            - logger.log: "on_boot: MQTT connected — publishing discovery"
+            - lorawan.publish_discovery:
+            - delay: 1s         # let publishes flush before we maybe disable WiFi
+          else:
+            - logger.log: "on_boot: MQTT timed out — discovery skipped this cycle"
+
+      # NOW honour wifi_enabled for the rest of this wake cycle.
+      # Stop MQTT before tearing down WiFi so ESP-IDF doesn't log socket-abort
+      # errors for the few seconds between WiFi-down and MQTT noticing.
+      - if:
+          condition:
+            switch.is_off: wifi_enabled
+          then:
+            - logger.log: "on_boot: wifi_enabled=OFF → entering battery mode"
+            - lambda: 'id(mqtt_client).disable();'
+            - wifi.disable:
+
+      # Wait for sensors to produce their first reading, then uplink.
+      - delay: 10s
+      - lorawan.send:
+
+esp32:
+  board: lolin32_lite
+  framework:
+    type: arduino
+
+# Enable logging
+logger:
+
+#Enable Home Assistant API
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+  # Enable fallback hotspot (captive portal) in case wifi connection fails
+  ap:
+    ssid: !secret ap_ssid
+    password: !secret ap_password
+
+captive_portal:
+
+i2c:
+  sda: GPIO00
+  scl: GPIO04
+  scan: true
+  id: bus_a
+
+mqtt:
+  id: mqtt_client
+  broker: !secret mqtt_broker
+  username: !secret mqtt_user
+  password: !secret mqtt_password
+  # Don't auto-publish HA discovery for the ESP's own entities — they're
+  # already exposed via api:.  We only use this mqtt client to publish our
+  # explicit button-discovery messages and LoRaWAN downlink commands.
+  discovery: false
+  # Don't block setup() if the broker is unreachable (e.g. WiFi down).
+  reboot_timeout: 0s
+
+sensor:
+  - platform: wifi_signal
+    name: "WiFi RSSI"
+    id: wifi_rssi
+    update_interval: 60s
+    entity_category: "diagnostic"
+  - platform: uptime
+    id: device_uptime
+    type: seconds
+    name: Uptime Sensor
+    update_interval: 10s
+  - platform: tcs34725
+    red_channel:
+      name: "TCS34725 Red Channel"
+      id: tcs34725_red_channel
+    green_channel:
+      name: "TCS34725 Green Channel"
+      id: tcs34725_green_Channel
+    blue_channel:
+      name: "TCS34725 Blue Channel"
+      id: tcs34725_blue_channel
+    clear_channel:
+      name: "TCS34725 Clear Channel"
+      id: tcs34725_clear_channel
+    illuminance:
+      name: "TCS34725 Illuminance"
+      id: tcs34725_illuminance
+    color_temperature:
+      name: "TCS34725 Color Temperature"
+      id: tcs34725_color_temperature
+    glass_attenuation_factor: 1.0
+    address: 0x29
+    update_interval: 60s
+
+switch:
+  - platform: template
+    name: "LoRa Test Switch"
+    id: lora_test_switch
+    optimistic: true       # state flips locally when turn_on/turn_off is called
+    turn_on_action:
+      - logger.log: "LoRa downlink: switch ON"
+    turn_off_action:
+      - logger.log: "LoRa downlink: switch OFF"
+
+  # WiFi master switch. Turning ON also blocks deep sleep so OTA/HA stay reachable.
+  # Default ON — device boots reachable; flip OFF to enter battery mode.
+  # We also stop/start the MQTT client in lockstep with WiFi so ESP-IDF's MQTT
+  # subsystem doesn't spam ERROR logs trying to reconnect over a dead link.
+  - platform: template
+    name: "WiFi enabled"
+    id: wifi_enabled
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_ON
+    turn_on_action:
+      - wifi.enable:
+      - deep_sleep.prevent: ds
+      - lambda: 'id(mqtt_client).enable();'   # resume MQTT after WiFi is back
+      - logger.log: "WiFi ON → deep sleep prevented"
+    turn_off_action:
+      - lambda: 'id(mqtt_client).disable();'  # stop MQTT before WiFi drops
+      - wifi.disable:
+      - logger.log: "WiFi OFF"
+
+  # Master deep-sleep override. When OFF, the device never sleeps regardless
+  # of WiFi state — useful for staying online during diagnostics or OTA.
+  # Default OFF — device stays awake until you explicitly enable sleep.
+  - platform: template
+    name: "Deep sleep enabled"
+    id: deep_sleep_enabled
+    optimistic: true
+    restore_mode: RESTORE_DEFAULT_OFF
+    turn_on_action:
+      - deep_sleep.allow: ds
+      - logger.log: "Deep sleep allowed"
+    turn_off_action:
+      - deep_sleep.prevent: ds
+      - logger.log: "Deep sleep prevented"
+
+# How long the device sleeps between wakes.  Settable from HA's UI (the
+# api:-backed entity below) AND via LoRaWAN downlink (handled by the
+# component's downlink_numbers binding on channel 13).  An MQTT-discovered
+# virtual number with the same role is auto-published by lorawan.publish_discovery.
+number:
+  - platform: template
+    name: "Sleep duration (s)"
+    id: sleep_duration_s
+    min_value: 60
+    max_value: 65535
+    step: 1
+    initial_value: 60
+    optimistic: true
+    restore_value: true
+    unit_of_measurement: s
+    mode: box
+    set_action:
+      - logger.log:
+          format: "Sleep duration set to %.0f s"
+          args: ['x']
+      # Push the new value into the deep_sleep component for the next cycle.
+      - lambda: |-
+          id(ds).set_sleep_duration((uint32_t) x * 1000UL);
+
+deep_sleep:
+  id: ds
+  # Awake budget per wake cycle.  Boot → on_boot's 10 s wait → lorawan.send →
+  # sendReceive (~6 s) → buffer.  30 s comfortably covers all of that.
+  run_duration: 30s
+  # Default sleep duration; overridden at runtime by sleep_duration_s.set_action.
+  sleep_duration: 60s
+
+# Periodic uplinks while the device is awake (i.e. when deep sleep is OFF).
+# When deep sleep is ON the device wakes, on_boot fires lorawan.send, sleeps —
+# this interval rarely gets a chance to run in that mode, and that's fine.
+interval:
+  - interval: 60s
+    then:
+      - lorawan.send:
+
+external_components:
+  - source:
+      type: local
+      path: components
+
+lorawan:
+  nss_pin: 5
+  dio1_pin: 26
+  rst_pin: 14
+  busy_pin: 27
+  txen_pin: 32
+  rxen_pin: 33
+  join_eui: ${join_eui}
+  dev_eui:  ${dev_eui}
+  app_key:  ${app_key}
+  port: 1
+
+  # HA MQTT discovery — `lorawan.publish_discovery:` will emit retained
+  # config messages for every entity below.  HA picks them up as a virtual
+  # "LoRaWAN" device, always available regardless of the ESP's online state.
+  mqtt_discovery:
+    chirpstack_app_id: ${app_id}
+    device_name: "LoRaWAN ${dev_eui}"
+
+    # Compound switches — one HA toggle = one ChirpStack downlink that sets
+    # multiple device states at once.  Faster mode change than toggling each
+    # individual switch in sequence (which would queue two separate downlinks).
+    downlink_compound_switches:
+      - name: "LoRaWAN mode"
+        # Online: WiFi on, deep-sleep off
+        when_on:
+          - { channel: 11, value: true }   # ch11 = wifi_enabled
+          - { channel: 12, value: false }  # ch12 = deep_sleep_enabled
+        # Battery: WiFi off, deep-sleep on
+        when_off:
+          - { channel: 11, value: false }
+          - { channel: 12, value: true }
+        fport: 11
+        state_from_channel: 11             # use WiFi state echo as the toggle state
+        ha:
+          icon: "mdi:satellite-uplink"
+
+    # Diagnostic sensors pulled out of the uplink event JSON itself.
+    # value_template is HA Jinja2 evaluated against `value_json` on each uplink.
+    diagnostic_sensors:
+      - name: "Last update"
+        value_template: "{{ value_json.rxInfo[0].nsTime }}"
+        device_class: timestamp
+      - name: "LoRaWAN RSSI"
+        value_template: "{{ value_json.rxInfo[0].rssi }}"
+        unit_of_measurement: dBm
+        device_class: signal_strength
+        state_class: measurement
+
+  cayenne_sensors:
+    - sensor: device_uptime
+      channel: 1
+      type: u32             # custom: 4-byte unsigned, with scale below
+      scale: 0.0166667      # seconds → minutes (1/60); u32 max → ~136 years
+      ha:                   # override — unit becomes "min" after scaling
+        name: "Uptime"
+        unit_of_measurement: min
+        device_class: duration
+        state_class: total_increasing
+    - sensor: wifi_rssi
+      channel: 2
+      type: analog_output   # signed, ÷100 — fits RSSI dBm
+      # no ha: → inherits name/unit/device_class from the wifi_signal sensor
+    - sensor: tcs34725_illuminance
+      channel: 3
+      type: illuminance
+      # inherits from the tcs34725 sensor definition
+
+  downlink_switches:
+    - switch: lora_test_switch
+      channel: 10           # [0x0A 0x01 <0|1>]
+      report_state: true    # echo state in uplink as digital_input on ch 10
+    - switch: wifi_enabled
+      channel: 11
+      report_state: true
+      ha:
+        name: "WiFi enabled"
+        icon: "mdi:wifi"
+    - switch: deep_sleep_enabled
+      channel: 12
+      report_state: true
+      ha:
+        name: "Deep sleep enabled"
+        icon: "mdi:power-sleep"
+
+  downlink_numbers:
+    - number: sleep_duration_s
+      channel: 13
+      type: u16             # [0x0D 0xF0 <hi> <lo>], 0..65535 seconds (~18 h)
+      report_state: true    # echo current value back in uplink as ch13_u16
+      ha:
+        name: "Sleep duration"
