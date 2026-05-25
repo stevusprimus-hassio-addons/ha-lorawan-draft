@@ -1,4 +1,3 @@
-import base64
 import re
 
 import esphome.codegen as cg
@@ -108,11 +107,12 @@ CONF_MODE                = "mode"
 CONF_VALUE_TEMPLATE      = "value_template"
 CONF_DIAGNOSTIC_SENSORS  = "diagnostic_sensors"
 CONF_DOWNLINK_COMPOUND_SWITCHES = "downlink_compound_switches"
-CONF_WHEN_ON             = "when_on"
-CONF_WHEN_OFF            = "when_off"
-CONF_VALUE               = "value"
-CONF_FPORT               = "fport"
-CONF_STATE_FROM_CHANNEL  = "state_from_channel"
+CONF_WHEN_ON                    = "when_on"
+CONF_WHEN_OFF                   = "when_off"
+CONF_VALUE                      = "value"
+CONF_FPORT                      = "fport"
+CONF_STATE_FROM_CHANNEL         = "state_from_channel"
+CONF_INCLUDE_NUMBER_CHANNELS    = "include_number_channels"
 
 HA_OVERRIDES_SCHEMA = cv.Schema({
     cv.Optional(CONF_NAME):                cv.string,
@@ -228,6 +228,12 @@ DOWNLINK_COMPOUND_SWITCH_SCHEMA = cv.Schema({
     cv.Required(CONF_NAME):     cv.string,
     cv.Required(CONF_WHEN_ON):  cv.ensure_list(COMPOUND_ACTION_SCHEMA),
     cv.Required(CONF_WHEN_OFF): cv.ensure_list(COMPOUND_ACTION_SCHEMA),
+    # Channels whose current downlink_number state is appended to the payload
+    # at publish_discovery time.  Useful to bundle a number setting (e.g. sleep
+    # duration) into the same downlink as the boolean switch fields.
+    cv.Optional(CONF_INCLUDE_NUMBER_CHANNELS, default=[]): cv.ensure_list(
+        cv.int_range(min=0, max=255)
+    ),
     cv.Optional(CONF_FPORT, default=1): cv.int_range(min=1, max=223),
     # Optional: which channel's digital_input echo represents this switch's state.
     # Omit for an optimistic switch with no state feedback.
@@ -236,14 +242,16 @@ DOWNLINK_COMPOUND_SWITCH_SCHEMA = cv.Schema({
 })
 
 
-def _compound_lpp_base64(actions):
-    """Encode a list of {channel, value} into the base64 LPP byte sequence."""
+def _compound_lpp_bytes_expr(actions):
+    """Encode a list of {channel, value} into a C++ std::vector<uint8_t> RawExpression."""
     raw = bytearray()
     for a in actions:
         raw.append(int(a[CONF_CHANNEL]) & 0xFF)
         raw.append(0x01)                            # LPP digital_output
         raw.append(0x01 if a[CONF_VALUE] else 0x00)
-    return base64.b64encode(bytes(raw)).decode()
+    return cg.RawExpression(
+        "std::vector<uint8_t>{" + ", ".join(f"0x{b:02X}" for b in raw) + "}"
+    )
 
 
 # Extra MQTT diagnostic sensors whose value comes out of the uplink event JSON
@@ -422,15 +430,22 @@ async def to_code(config):
         # Compound switches — one downlink with multiple LPP fields per toggle.
         for c_conf in d_conf.get(CONF_DOWNLINK_COMPOUND_SWITCHES, []):
             slug = _slugify(c_conf[CONF_NAME])
+            include_channels = c_conf.get(CONF_INCLUDE_NUMBER_CHANNELS, [])
+            include_expr = cg.RawExpression(
+                "std::vector<uint8_t>{"
+                + ", ".join(str(ch) for ch in include_channels)
+                + "}"
+            )
             entry = cg.StructInitializer(
                 CompoundSwitchEntry,
-                ("slug",               slug),
-                ("name",               c_conf[CONF_NAME]),
-                ("payload_on_b64",     _compound_lpp_base64(c_conf[CONF_WHEN_ON])),
-                ("payload_off_b64",    _compound_lpp_base64(c_conf[CONF_WHEN_OFF])),
-                ("fport",              c_conf[CONF_FPORT]),
-                ("state_from_channel", c_conf.get(CONF_STATE_FROM_CHANNEL, -1)),
-                ("ha",                 _ha_struct(c_conf.get(CONF_HA))),
+                ("slug",                    slug),
+                ("name",                    c_conf[CONF_NAME]),
+                ("static_bytes_on",         _compound_lpp_bytes_expr(c_conf[CONF_WHEN_ON])),
+                ("static_bytes_off",        _compound_lpp_bytes_expr(c_conf[CONF_WHEN_OFF])),
+                ("include_number_channels", include_expr),
+                ("fport",                   c_conf[CONF_FPORT]),
+                ("state_from_channel",      c_conf.get(CONF_STATE_FROM_CHANNEL, -1)),
+                ("ha",                      _ha_struct(c_conf.get(CONF_HA))),
             )
             cg.add(var.add_compound_switch(entry))
 

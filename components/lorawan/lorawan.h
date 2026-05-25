@@ -130,7 +130,8 @@ struct DiagnosticSensorEntry {
 // Compound switch: one HA MQTT switch that publishes a SINGLE downlink
 // containing multiple LPP digital_output fields — toggling several device
 // states (WiFi + deep-sleep, say) in a single ChirpStack queue item.
-// payload_on_b64 / payload_off_b64 are precomputed at codegen time.
+// static_bytes_on/off are baked at codegen time; include_number_channels lets
+// publish_discovery() append live number values so all settings go in one frame.
 struct CompoundSwitchEntry {
   std::string slug;
   std::string name;

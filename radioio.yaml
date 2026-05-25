@@ -19,6 +19,9 @@ esphome:
     # wait for sensors to settle, then trigger one LoRaWAN cycle.
     priority: -100
     then:
+      # Mark setup complete — guards in turn_on/off actions check this before
+      # calling mqtt_client.enable() to avoid crashing during setup().
+      - lambda: 'id(setup_done) = true;'
       - lambda: |-
           ESP_LOGI("on_boot", "start — wifi_enabled=%s  deep_sleep_enabled=%s",
                    id(wifi_enabled).state ? "ON" : "OFF",
@@ -67,6 +70,15 @@ esp32:
   board: lolin32_lite
   framework:
     type: arduino
+
+# Set to true once on_boot fires — i.e. after all setup() calls have
+# completed.  Used to guard actions that crash if called too early
+# (e.g. mqtt_client.enable() before LwIP is initialised).
+globals:
+  - id: setup_done
+    type: bool
+    initial_value: 'false'
+    restore_value: false
 
 # Enable logging
 logger:
@@ -165,7 +177,13 @@ switch:
     turn_on_action:
       - wifi.enable:
       - deep_sleep.prevent: ds
-      - lambda: 'id(mqtt_client).enable();'   # resume MQTT after WiFi is back
+      # Guard: during setup() the LwIP mutex doesn't exist yet and
+      # enable() would assert-crash.  Only re-enable MQTT after on_boot
+      # has set setup_done (i.e. when user flips the switch at runtime).
+      - lambda: |-
+          if (id(setup_done)) {
+            id(mqtt_client).enable();
+          }
       - logger.log: "WiFi ON → deep sleep prevented"
     turn_off_action:
       - lambda: 'id(mqtt_client).disable();'  # stop MQTT before WiFi drops
@@ -264,6 +282,9 @@ lorawan:
         when_off:
           - { channel: 11, value: false }
           - { channel: 12, value: true }
+        # Also bundle the current sleep duration (ch13) so all three settings
+        # land in one ChirpStack downlink — no second queue item needed.
+        include_number_channels: [13]
         fport: 11
         state_from_channel: 11             # use WiFi state echo as the toggle state
         ha:

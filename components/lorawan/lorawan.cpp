@@ -688,6 +688,25 @@ void json_append_str(std::string &json, const char *key, const std::string &valu
   json += "\"";
 }
 
+// Encode raw bytes as standard Base64.  Used to bake number-state bytes into
+// compound-switch downlink payloads at publish_discovery() time.
+static std::string base64_encode(const std::vector<uint8_t> &data) {
+  static const char *const B64 =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+  std::string out;
+  out.reserve(((data.size() + 2) / 3) * 4);
+  for (size_t i = 0; i < data.size(); i += 3) {
+    uint32_t n = static_cast<uint32_t>(data[i]) << 16;
+    if (i + 1 < data.size()) n |= static_cast<uint32_t>(data[i + 1]) << 8;
+    if (i + 2 < data.size()) n |= static_cast<uint32_t>(data[i + 2]);
+    out.push_back(B64[(n >> 18) & 0x3F]);
+    out.push_back(B64[(n >> 12) & 0x3F]);
+    out.push_back(i + 1 < data.size() ? B64[(n >> 6) & 0x3F] : '=');
+    out.push_back(i + 2 < data.size() ? B64[n & 0x3F] : '=');
+  }
+  return out;
+}
+
 }  // anonymous namespace
 
 void LoRaWANComponent::publish_discovery() {
@@ -960,15 +979,72 @@ void LoRaWANComponent::publish_discovery() {
     const std::string icon    = e.ha.icon;
     const std::string ent_cat = e.ha.entity_category;
 
-    // payload_on / payload_off — pre-baked downlink JSON strings.
-    auto wrap = [&](const std::string &b64) -> std::string {
+    // Build the full LPP byte sequence for each downlink direction:
+    //   static_bytes_on/off  — the digital_output fields baked at codegen time
+    //   include_number_channels — current state of those number entities appended
+    //     dynamically at publish time so the live value is captured on every boot.
+    auto build_payload = [&](const std::vector<uint8_t> &static_bytes) -> std::string {
+      std::vector<uint8_t> bytes = static_bytes;
+      for (uint8_t ch : e.include_number_channels) {
+        for (const auto &ne : downlink_numbers_) {
+          if (ne.channel != ch) continue;
+          if (!ne.num->has_state()) break;
+          const float wire = ne.num->state / (ne.scale == 0.0f ? 1.0f : ne.scale);
+          switch (ne.type) {
+            case CayenneType::ANALOG_OUTPUT: {
+              int16_t v = static_cast<int16_t>(wire * 100.0f);
+              bytes.insert(bytes.end(), {ch, LPP_TYPE_ANALOG_OUTPUT,
+                                         static_cast<uint8_t>((static_cast<uint16_t>(v) >> 8) & 0xFF),
+                                         static_cast<uint8_t>(static_cast<uint16_t>(v) & 0xFF)});
+              break;
+            }
+            case CayenneType::U16: {
+              uint16_t v = static_cast<uint16_t>(wire);
+              bytes.insert(bytes.end(), {ch, LPP_TYPE_U16,
+                                         static_cast<uint8_t>((v >> 8) & 0xFF),
+                                         static_cast<uint8_t>(v & 0xFF)});
+              break;
+            }
+            case CayenneType::U32: {
+              uint32_t v = static_cast<uint32_t>(wire);
+              bytes.insert(bytes.end(), {ch, LPP_TYPE_U32,
+                                         static_cast<uint8_t>((v >> 24) & 0xFF),
+                                         static_cast<uint8_t>((v >> 16) & 0xFF),
+                                         static_cast<uint8_t>((v >> 8) & 0xFF),
+                                         static_cast<uint8_t>(v & 0xFF)});
+              break;
+            }
+            case CayenneType::I16: {
+              int16_t v = static_cast<int16_t>(wire);
+              uint16_t u = static_cast<uint16_t>(v);
+              bytes.insert(bytes.end(), {ch, LPP_TYPE_I16,
+                                         static_cast<uint8_t>((u >> 8) & 0xFF),
+                                         static_cast<uint8_t>(u & 0xFF)});
+              break;
+            }
+            case CayenneType::I32: {
+              int32_t v = static_cast<int32_t>(wire);
+              uint32_t u = static_cast<uint32_t>(v);
+              bytes.insert(bytes.end(), {ch, LPP_TYPE_I32,
+                                         static_cast<uint8_t>((u >> 24) & 0xFF),
+                                         static_cast<uint8_t>((u >> 16) & 0xFF),
+                                         static_cast<uint8_t>((u >> 8) & 0xFF),
+                                         static_cast<uint8_t>(u & 0xFF)});
+              break;
+            }
+            default: break;
+          }
+          break;  // channel matched — move to next include_number_channels entry
+        }
+      }
+      const std::string b64 = base64_encode(bytes);
       return std::string("{\"devEui\":\"") + dev_eui_hex_ + "\""
            + ",\"confirmed\":false"
            + ",\"fPort\":" + std::to_string(e.fport)
            + ",\"data\":\"" + b64 + "\"}";
     };
-    const std::string payload_on  = wrap(e.payload_on_b64);
-    const std::string payload_off = wrap(e.payload_off_b64);
+    const std::string payload_on  = build_payload(e.static_bytes_on);
+    const std::string payload_off = build_payload(e.static_bytes_off);
 
     // If state_from_channel >= 0, mirror that channel's digital_input echo.
     // Otherwise the switch is optimistic (HA flips immediately on press).
