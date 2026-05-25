@@ -13,63 +13,108 @@ substitutions:
 esphome:
   name: ${name}
   friendly_name: ${friendly_name}
+  includes:
+    - triple_rst.h      # RTC-RAM RST-press counter for triple-RST AP mode
   on_boot:
-    # Run after all components are set up.  Apply restored switch states,
-    # publish HA discovery for the remote-control buttons (once API is up),
-    # wait for sensors to settle, then trigger one LoRaWAN cycle.
+    # Run after all components are set up.  Checks for triple-RST press first;
+    # if detected, enters WiFi AP maintenance mode and skips everything else.
+    # Otherwise runs the normal boot sequence.
     priority: -100
     then:
-      # Mark setup complete — guards in turn_on/off actions check this before
-      # calling mqtt_client.enable() to avoid crashing during setup().
-      - lambda: 'id(setup_done) = true;'
+      # triple_rst_check() counts ESP_RST_EXT (physical RST button) resets in
+      # RTC RAM.  Any other reset type (power-on, deep-sleep, watchdog) resets
+      # the counter, so normal cycling never accumulates.
       - lambda: |-
-          ESP_LOGI("on_boot", "start — wifi_enabled=%s  deep_sleep_enabled=%s",
-                   id(wifi_enabled).state ? "ON" : "OFF",
-                   id(deep_sleep_enabled).state ? "ON" : "OFF");
+          if (triple_rst_check()) {
+            id(triple_rst_active) = true;
+          }
+
       - if:
           condition:
-            switch.is_off: deep_sleep_enabled
+            lambda: 'return id(triple_rst_active);'
           then:
+            # ---------------------------------------------------------------- #
+            # Triple-RST AP maintenance mode
+            # Join WiFi SSID "<device-name>-ap", password "radioio12".
+            # Open http://192.168.4.1 for the ESPHome web UI / OTA.
+            # Press RST once to leave AP mode and return to normal operation.
+            # ---------------------------------------------------------------- #
+            - logger.log:
+                level: WARN
+                format: "*** AP MODE *** Triple RST detected"
+            - logger.log:
+                level: WARN
+                format: "  SSID     : %s-ap"
+                args: [App.get_name().c_str()]
+            - logger.log:
+                level: WARN
+                format: "  Password : radioio12"
+            - logger.log:
+                level: WARN
+                format: "  URL      : http://192.168.4.1"
+            # Start soft-AP via ESP-IDF (compatible with ESPHome's IDF WiFi component).
+            # Switches WiFi to APSTA mode and configures the AP interface;
+            # ESPHome's STA management continues alongside it.
+            - lambda: |-
+                start_maintenance_ap((App.get_name() + "-ap").c_str(), "radioio12");
             - deep_sleep.prevent: ds
 
-      # Try to publish HA MQTT discovery on EVERY boot, regardless of
-      # wifi_enabled — discovery is retained on the broker and idempotent.
-      # We wait briefly for MQTT to come up; if it doesn't, we skip and the
-      # already-retained discovery on the broker keeps HA happy.
-      - logger.log: "on_boot: waiting up to 15s for MQTT to publish discovery"
-      - wait_until:
-          condition:
-            mqtt.connected:
-          timeout: 15s
-      - if:
-          condition:
-            mqtt.connected:
-          then:
-            - logger.log: "on_boot: MQTT connected — publishing discovery"
-            - lorawan.publish_discovery:
-            - delay: 1s         # let publishes flush before we maybe disable WiFi
           else:
-            - logger.log: "on_boot: MQTT timed out — discovery skipped this cycle"
+            # ---------------------------------------------------------------- #
+            # Normal boot sequence
+            # ---------------------------------------------------------------- #
 
-      # NOW honour wifi_enabled for the rest of this wake cycle.
-      # Stop MQTT before tearing down WiFi so ESP-IDF doesn't log socket-abort
-      # errors for the few seconds between WiFi-down and MQTT noticing.
-      - if:
-          condition:
-            switch.is_off: wifi_enabled
-          then:
-            - logger.log: "on_boot: wifi_enabled=OFF → entering battery mode"
-            - lambda: 'id(mqtt_client).disable();'
-            - wifi.disable:
+            # Mark setup complete — guards in turn_on/off actions check this
+            # before calling mqtt_client.enable() to avoid crashing during setup().
+            - lambda: 'id(setup_done) = true;'
+            - lambda: |-
+                ESP_LOGI("on_boot", "start — wifi_enabled=%s  deep_sleep_enabled=%s",
+                         id(wifi_enabled).state ? "ON" : "OFF",
+                         id(deep_sleep_enabled).state ? "ON" : "OFF");
+            - if:
+                condition:
+                  switch.is_off: deep_sleep_enabled
+                then:
+                  - deep_sleep.prevent: ds
 
-      # Apply the restored/initial sleep duration to the deep_sleep component.
-      # set_action does not fire on initial_value or NVS restore, so we push
-      # the current number state manually on every boot.
-      - lambda: 'id(ds).set_sleep_duration((uint32_t) id(sleep_duration_s).state * 1000UL);'
+            # Try to publish HA MQTT discovery on EVERY boot, regardless of
+            # wifi_enabled — discovery is retained on the broker and idempotent.
+            # We wait briefly for MQTT to come up; if it doesn't, we skip and the
+            # already-retained discovery on the broker keeps HA happy.
+            - logger.log: "on_boot: waiting up to 15s for MQTT to publish discovery"
+            - wait_until:
+                condition:
+                  mqtt.connected:
+                timeout: 15s
+            - if:
+                condition:
+                  mqtt.connected:
+                then:
+                  - logger.log: "on_boot: MQTT connected — publishing discovery"
+                  - lorawan.publish_discovery:
+                  - delay: 1s         # let publishes flush before we maybe disable WiFi
+                else:
+                  - logger.log: "on_boot: MQTT timed out — discovery skipped this cycle"
 
-      # Wait for sensors to produce their first reading, then uplink.
-      - delay: 10s
-      - lorawan.send:
+            # NOW honour wifi_enabled for the rest of this wake cycle.
+            # Stop MQTT before tearing down WiFi so ESP-IDF doesn't log socket-abort
+            # errors for the few seconds between WiFi-down and MQTT noticing.
+            - if:
+                condition:
+                  switch.is_off: wifi_enabled
+                then:
+                  - logger.log: "on_boot: wifi_enabled=OFF → entering battery mode"
+                  - lambda: 'id(mqtt_client).disable();'
+                  - wifi.disable:
+
+            # Apply the restored/initial sleep duration to the deep_sleep component.
+            # set_action does not fire on initial_value or NVS restore, so we push
+            # the current number state manually on every boot.
+            - lambda: 'id(ds).set_sleep_duration((uint32_t) id(sleep_duration_s).state * 1000UL);'
+
+            # Wait for sensors to produce their first reading, then uplink.
+            - delay: 10s
+            - lorawan.send:
 
 esp32:
   board: lolin32_lite
@@ -81,6 +126,11 @@ esp32:
 # (e.g. mqtt_client.enable() before LwIP is initialised).
 globals:
   - id: setup_done
+    type: bool
+    initial_value: 'false'
+    restore_value: false
+  # Set by the triple-RST check in on_boot; never persisted across boots.
+  - id: triple_rst_active
     type: bool
     initial_value: 'false'
     restore_value: false
