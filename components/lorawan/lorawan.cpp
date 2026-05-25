@@ -354,14 +354,16 @@ void LoRaWANComponent::add_cayenne_sensor(sensor::Sensor *sensor, uint8_t channe
 }
 
 void LoRaWANComponent::add_downlink_switch(switch_::Switch *sw, uint8_t channel,
-                                            bool report_state, const HaOverrides &ha) {
-  downlink_switches_.push_back({sw, channel, report_state, ha});
+                                            bool report_state, const HaOverrides &ha,
+                                            bool ha_discovery) {
+  downlink_switches_.push_back({sw, channel, report_state, ha, ha_discovery});
 }
 
 void LoRaWANComponent::add_downlink_number(number::Number *num, uint8_t channel,
                                             CayenneType type, float scale,
-                                            bool report_state, const HaOverrides &ha) {
-  downlink_numbers_.push_back({num, channel, type, scale, report_state, ha});
+                                            bool report_state, const HaOverrides &ha,
+                                            bool ha_discovery) {
+  downlink_numbers_.push_back({num, channel, type, scale, report_state, ha, ha_discovery});
 }
 
 void LoRaWANComponent::add_diagnostic_sensor(const DiagnosticSensorEntry &entry) {
@@ -370,6 +372,14 @@ void LoRaWANComponent::add_diagnostic_sensor(const DiagnosticSensorEntry &entry)
 
 void LoRaWANComponent::add_compound_switch(const CompoundSwitchEntry &entry) {
   compound_switches_.push_back(entry);
+}
+
+void LoRaWANComponent::add_downlink_button(const DownlinkButtonEntry &entry) {
+  downlink_buttons_.push_back(entry);
+}
+
+void LoRaWANComponent::add_diagnostic_binary_sensor(const DiagnosticBinarySensorEntry &entry) {
+  diagnostic_binary_sensors_.push_back(entry);
 }
 
 void LoRaWANComponent::set_payload_lambda(const std::function<std::vector<uint8_t>()> &lambda) {
@@ -762,8 +772,79 @@ void LoRaWANComponent::publish_discovery() {
     ESP_LOGI(TAG, "Discovery: sensor ch%u → '%s'", e.channel, name.c_str());
   }
 
+  // Helper: append the current LPP-encoded state of `channels` to `bytes`.
+  // Shared by the compound-switch and button discovery sections.
+  auto append_number_lpp = [&](std::vector<uint8_t> &bytes, const std::vector<uint8_t> &channels) {
+    for (uint8_t ch : channels) {
+      for (const auto &ne : downlink_numbers_) {
+        if (ne.channel != ch) continue;
+        if (!ne.num->has_state()) break;
+        const float wire = ne.num->state / (ne.scale == 0.0f ? 1.0f : ne.scale);
+        switch (ne.type) {
+          case CayenneType::ANALOG_OUTPUT: {
+            int16_t v = static_cast<int16_t>(wire * 100.0f);
+            uint16_t u = static_cast<uint16_t>(v);
+            bytes.insert(bytes.end(), {ch, LPP_TYPE_ANALOG_OUTPUT,
+                                       static_cast<uint8_t>((u >> 8) & 0xFF),
+                                       static_cast<uint8_t>(u & 0xFF)});
+            break;
+          }
+          case CayenneType::U16: {
+            uint16_t v = static_cast<uint16_t>(wire);
+            bytes.insert(bytes.end(), {ch, LPP_TYPE_U16,
+                                       static_cast<uint8_t>((v >> 8) & 0xFF),
+                                       static_cast<uint8_t>(v & 0xFF)});
+            break;
+          }
+          case CayenneType::U32: {
+            uint32_t v = static_cast<uint32_t>(wire);
+            bytes.insert(bytes.end(), {ch, LPP_TYPE_U32,
+                                       static_cast<uint8_t>((v >> 24) & 0xFF),
+                                       static_cast<uint8_t>((v >> 16) & 0xFF),
+                                       static_cast<uint8_t>((v >> 8) & 0xFF),
+                                       static_cast<uint8_t>(v & 0xFF)});
+            break;
+          }
+          case CayenneType::I16: {
+            int16_t v = static_cast<int16_t>(wire);
+            uint16_t u = static_cast<uint16_t>(v);
+            bytes.insert(bytes.end(), {ch, LPP_TYPE_I16,
+                                       static_cast<uint8_t>((u >> 8) & 0xFF),
+                                       static_cast<uint8_t>(u & 0xFF)});
+            break;
+          }
+          case CayenneType::I32: {
+            int32_t v = static_cast<int32_t>(wire);
+            uint32_t u = static_cast<uint32_t>(v);
+            bytes.insert(bytes.end(), {ch, LPP_TYPE_I32,
+                                       static_cast<uint8_t>((u >> 24) & 0xFF),
+                                       static_cast<uint8_t>((u >> 16) & 0xFF),
+                                       static_cast<uint8_t>((u >> 8) & 0xFF),
+                                       static_cast<uint8_t>(u & 0xFF)});
+            break;
+          }
+          default: break;
+        }
+        break;  // channel matched; move to next entry in channels
+      }
+    }
+  };
+
+  // Helper: wrap base64-encoded LPP bytes in a ChirpStack downlink JSON envelope.
+  auto make_downlink_json = [&](const std::vector<uint8_t> &static_bytes,
+                                 const std::vector<uint8_t> &extra_channels,
+                                 int fport) -> std::string {
+    std::vector<uint8_t> bytes = static_bytes;
+    append_number_lpp(bytes, extra_channels);
+    return std::string("{\"devEui\":\"") + dev_eui_hex_ + "\""
+         + ",\"confirmed\":false"
+         + ",\"fPort\":" + std::to_string(fport)
+         + ",\"data\":\"" + base64_encode(bytes) + "\"}";
+  };
+
   // ---------- Switches -------------------------------------------------------
   for (const auto &e : downlink_switches_) {
+    if (!e.ha_discovery) continue;
     const std::string ch_str = std::to_string(e.channel);
     const std::string uid    = device_id + "_ch" + ch_str;
     const std::string topic  = discovery_prefix_ + "/switch/" + device_id + "/ch" + ch_str + "/config";
@@ -830,6 +911,7 @@ void LoRaWANComponent::publish_discovery() {
   // ---------- Numbers --------------------------------------------------------
   // command_template is pure-Jinja2 base64 encoder for the LPP type's bytes.
   for (const auto &e : downlink_numbers_) {
+    if (!e.ha_discovery) continue;
     const std::string ch_str = std::to_string(e.channel);
     const std::string uid    = device_id + "_ch" + ch_str;
     const std::string topic  = discovery_prefix_ + "/number/" + device_id + "/ch" + ch_str + "/config";
@@ -979,72 +1061,8 @@ void LoRaWANComponent::publish_discovery() {
     const std::string icon    = e.ha.icon;
     const std::string ent_cat = e.ha.entity_category;
 
-    // Build the full LPP byte sequence for each downlink direction:
-    //   static_bytes_on/off  — the digital_output fields baked at codegen time
-    //   include_number_channels — current state of those number entities appended
-    //     dynamically at publish time so the live value is captured on every boot.
-    auto build_payload = [&](const std::vector<uint8_t> &static_bytes) -> std::string {
-      std::vector<uint8_t> bytes = static_bytes;
-      for (uint8_t ch : e.include_number_channels) {
-        for (const auto &ne : downlink_numbers_) {
-          if (ne.channel != ch) continue;
-          if (!ne.num->has_state()) break;
-          const float wire = ne.num->state / (ne.scale == 0.0f ? 1.0f : ne.scale);
-          switch (ne.type) {
-            case CayenneType::ANALOG_OUTPUT: {
-              int16_t v = static_cast<int16_t>(wire * 100.0f);
-              bytes.insert(bytes.end(), {ch, LPP_TYPE_ANALOG_OUTPUT,
-                                         static_cast<uint8_t>((static_cast<uint16_t>(v) >> 8) & 0xFF),
-                                         static_cast<uint8_t>(static_cast<uint16_t>(v) & 0xFF)});
-              break;
-            }
-            case CayenneType::U16: {
-              uint16_t v = static_cast<uint16_t>(wire);
-              bytes.insert(bytes.end(), {ch, LPP_TYPE_U16,
-                                         static_cast<uint8_t>((v >> 8) & 0xFF),
-                                         static_cast<uint8_t>(v & 0xFF)});
-              break;
-            }
-            case CayenneType::U32: {
-              uint32_t v = static_cast<uint32_t>(wire);
-              bytes.insert(bytes.end(), {ch, LPP_TYPE_U32,
-                                         static_cast<uint8_t>((v >> 24) & 0xFF),
-                                         static_cast<uint8_t>((v >> 16) & 0xFF),
-                                         static_cast<uint8_t>((v >> 8) & 0xFF),
-                                         static_cast<uint8_t>(v & 0xFF)});
-              break;
-            }
-            case CayenneType::I16: {
-              int16_t v = static_cast<int16_t>(wire);
-              uint16_t u = static_cast<uint16_t>(v);
-              bytes.insert(bytes.end(), {ch, LPP_TYPE_I16,
-                                         static_cast<uint8_t>((u >> 8) & 0xFF),
-                                         static_cast<uint8_t>(u & 0xFF)});
-              break;
-            }
-            case CayenneType::I32: {
-              int32_t v = static_cast<int32_t>(wire);
-              uint32_t u = static_cast<uint32_t>(v);
-              bytes.insert(bytes.end(), {ch, LPP_TYPE_I32,
-                                         static_cast<uint8_t>((u >> 24) & 0xFF),
-                                         static_cast<uint8_t>((u >> 16) & 0xFF),
-                                         static_cast<uint8_t>((u >> 8) & 0xFF),
-                                         static_cast<uint8_t>(u & 0xFF)});
-              break;
-            }
-            default: break;
-          }
-          break;  // channel matched — move to next include_number_channels entry
-        }
-      }
-      const std::string b64 = base64_encode(bytes);
-      return std::string("{\"devEui\":\"") + dev_eui_hex_ + "\""
-           + ",\"confirmed\":false"
-           + ",\"fPort\":" + std::to_string(e.fport)
-           + ",\"data\":\"" + b64 + "\"}";
-    };
-    const std::string payload_on  = build_payload(e.static_bytes_on);
-    const std::string payload_off = build_payload(e.static_bytes_off);
+    const std::string payload_on  = make_downlink_json(e.static_bytes_on,  e.include_number_channels, e.fport);
+    const std::string payload_off = make_downlink_json(e.static_bytes_off, e.include_number_channels, e.fport);
 
     // If state_from_channel >= 0, mirror that channel's digital_input echo.
     // Otherwise the switch is optimistic (HA flips immediately on press).
@@ -1078,6 +1096,53 @@ void LoRaWANComponent::publish_discovery() {
              name.c_str(), e.fport, e.state_from_channel);
   }
 
+  // ---------- Buttons -------------------------------------------------------
+  // One-shot HA MQTT buttons.  Pressing one publishes a fixed downlink payload
+  // to ChirpStack.  No state sync — use diagnostic_binary_sensors for read-back.
+  for (const auto &e : downlink_buttons_) {
+    const std::string uid   = device_id + "_btn_" + e.slug;
+    const std::string topic = discovery_prefix_ + "/button/" + device_id + "/btn_" + e.slug + "/config";
+
+    const std::string name    = pick(e.ha.name, e.name);
+    const std::string icon    = e.ha.icon;
+    const std::string ent_cat = e.ha.entity_category;
+
+    const std::string press_payload = make_downlink_json(e.static_bytes, e.include_number_channels, e.fport);
+
+    std::string payload = "{\"name\":\"" + json_escape(name) + "\"";
+    payload += ",\"unique_id\":\"" + uid + "\"";
+    payload += ",\"command_topic\":\"" + downlink_topic + "\"";
+    payload += ",\"payload_press\":\"" + json_escape(press_payload) + "\"";
+    json_append_str(payload, "icon",            icon);
+    json_append_str(payload, "entity_category", ent_cat);
+    payload += device_block;
+    payload += "}";
+
+    mqtt_client_->publish(topic, payload, 0, true);
+    ESP_LOGI(TAG, "Discovery: button '%s' (fport=%d)", name.c_str(), e.fport);
+  }
+
+  // ---------- Diagnostic binary sensors ------------------------------------
+  // Read-only state indicators driven by value_template on the uplink topic.
+  // value_template must evaluate to "ON" or "OFF".
+  for (const auto &e : diagnostic_binary_sensors_) {
+    const std::string uid   = device_id + "_bindiag_" + e.slug;
+    const std::string topic = discovery_prefix_ + "/binary_sensor/" + device_id + "/bindiag_" + e.slug + "/config";
+
+    std::string payload = "{\"name\":\"" + json_escape(e.name) + "\"";
+    payload += ",\"unique_id\":\"" + uid + "\"";
+    payload += ",\"state_topic\":\"" + uplink_topic + "\"";
+    payload += ",\"value_template\":\"" + json_escape(e.value_template) + "\"";
+    json_append_str(payload, "device_class",    e.device_class);
+    json_append_str(payload, "icon",            e.icon);
+    json_append_str(payload, "entity_category", e.entity_category);
+    payload += device_block;
+    payload += "}";
+
+    mqtt_client_->publish(topic, payload, 0, true);
+    ESP_LOGI(TAG, "Discovery: binary sensor '%s' → %s", e.name.c_str(), e.slug.c_str());
+  }
+
   // ---------- Diagnostic sensors --------------------------------------------
   // Pulled out of the ChirpStack uplink JSON itself, not the LPP payload.
   // HA evaluates the user-supplied Jinja2 value_template on each uplink.
@@ -1101,11 +1166,18 @@ void LoRaWANComponent::publish_discovery() {
     ESP_LOGI(TAG, "Discovery: diagnostic '%s' → %s", e.name.c_str(), e.slug.c_str());
   }
 
-  ESP_LOGI(TAG, "Discovery: published %u sensor / %u switch / %u compound / %u number / %u diagnostic entities",
+  // Count only ha_discovery=true entries for the log summary.
+  size_t sw_count  = 0; for (const auto &e : downlink_switches_) if (e.ha_discovery) ++sw_count;
+  size_t num_count = 0; for (const auto &e : downlink_numbers_)  if (e.ha_discovery) ++num_count;
+  ESP_LOGI(TAG,
+           "Discovery: %u sensor / %u switch / %u compound / %u number"
+           " / %u button / %u binary / %u diagnostic",
            (unsigned) cayenne_sensors_.size(),
-           (unsigned) downlink_switches_.size(),
+           (unsigned) sw_count,
            (unsigned) compound_switches_.size(),
-           (unsigned) downlink_numbers_.size(),
+           (unsigned) num_count,
+           (unsigned) downlink_buttons_.size(),
+           (unsigned) diagnostic_binary_sensors_.size(),
            (unsigned) diagnostic_sensors_.size());
 }
 

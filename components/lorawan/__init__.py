@@ -14,9 +14,11 @@ LoRaWANSendAction = lorawan_ns.class_("LoRaWANSendAction", automation.Action)
 LoRaWANPublishDiscoveryAction = lorawan_ns.class_(
     "LoRaWANPublishDiscoveryAction", automation.Action
 )
-HaOverrides            = lorawan_ns.struct("HaOverrides")
-DiagnosticSensorEntry  = lorawan_ns.struct("DiagnosticSensorEntry")
-CompoundSwitchEntry    = lorawan_ns.struct("CompoundSwitchEntry")
+HaOverrides                  = lorawan_ns.struct("HaOverrides")
+DiagnosticSensorEntry        = lorawan_ns.struct("DiagnosticSensorEntry")
+CompoundSwitchEntry          = lorawan_ns.struct("CompoundSwitchEntry")
+DownlinkButtonEntry          = lorawan_ns.struct("DownlinkButtonEntry")
+DiagnosticBinarySensorEntry  = lorawan_ns.struct("DiagnosticBinarySensorEntry")
 
 
 def _slugify(name: str) -> str:
@@ -113,6 +115,10 @@ CONF_VALUE                      = "value"
 CONF_FPORT                      = "fport"
 CONF_STATE_FROM_CHANNEL         = "state_from_channel"
 CONF_INCLUDE_NUMBER_CHANNELS    = "include_number_channels"
+CONF_HA_DISCOVERY               = "ha_discovery"
+CONF_DOWNLINK_BUTTONS           = "downlink_buttons"
+CONF_WHEN_PRESSED               = "when_pressed"
+CONF_DIAGNOSTIC_BINARY_SENSORS  = "diagnostic_binary_sensors"
 
 HA_OVERRIDES_SCHEMA = cv.Schema({
     cv.Optional(CONF_NAME):                cv.string,
@@ -200,6 +206,8 @@ DOWNLINK_SWITCH_SCHEMA = cv.Schema({
     cv.Required(CONF_CHANNEL): cv.int_range(min=0, max=255),
     cv.Optional(CONF_REPORT_STATE, default=False): cv.boolean,
     cv.Optional(CONF_HA): HA_OVERRIDES_SCHEMA,
+    # Set false to keep downlink processing but suppress HA MQTT discovery.
+    cv.Optional(CONF_HA_DISCOVERY, default=True): cv.boolean,
 })
 
 # Bind an existing ESPHome number to an LPP channel.  Picks the wire type so
@@ -213,6 +221,8 @@ DOWNLINK_NUMBER_SCHEMA = cv.Schema({
     cv.Optional(CONF_SCALE, default=1.0): cv.float_,
     cv.Optional(CONF_REPORT_STATE, default=False): cv.boolean,
     cv.Optional(CONF_HA): HA_OVERRIDES_SCHEMA,
+    # Set false to keep downlink processing but suppress HA MQTT discovery.
+    cv.Optional(CONF_HA_DISCOVERY, default=True): cv.boolean,
 })
 
 # An (channel, value) tuple in a compound switch's on/off action list.
@@ -239,6 +249,29 @@ DOWNLINK_COMPOUND_SWITCH_SCHEMA = cv.Schema({
     # Omit for an optimistic switch with no state feedback.
     cv.Optional(CONF_STATE_FROM_CHANNEL): cv.int_range(min=0, max=255),
     cv.Optional(CONF_HA): HA_OVERRIDES_SCHEMA,
+})
+
+
+# One-shot downlink button.  when_pressed encodes digital_output LPP fields;
+# include_number_channels appends current number states at publish_discovery time.
+DOWNLINK_BUTTON_SCHEMA = cv.Schema({
+    cv.Required(CONF_NAME):        cv.string,
+    cv.Required(CONF_WHEN_PRESSED): cv.ensure_list(COMPOUND_ACTION_SCHEMA),
+    cv.Optional(CONF_INCLUDE_NUMBER_CHANNELS, default=[]): cv.ensure_list(
+        cv.int_range(min=0, max=255)
+    ),
+    cv.Optional(CONF_FPORT, default=1): cv.int_range(min=1, max=223),
+    cv.Optional(CONF_HA): HA_OVERRIDES_SCHEMA,
+})
+
+# Binary sensor derived from the ChirpStack uplink JSON.
+# value_template must evaluate to "ON" or "OFF".
+DIAGNOSTIC_BINARY_SENSOR_SCHEMA = cv.Schema({
+    cv.Required(CONF_NAME):            cv.string,
+    cv.Required(CONF_VALUE_TEMPLATE):  cv.string,
+    cv.Optional(CONF_DEVICE_CLASS):    cv.string,
+    cv.Optional(CONF_ICON):            cv.icon,
+    cv.Optional(CONF_ENTITY_CATEGORY, default=""): cv.string,
 })
 
 
@@ -277,6 +310,8 @@ MQTT_DISCOVERY_SCHEMA = cv.Schema({
     cv.Optional(CONF_MQTT_ID):           cv.use_id(mqtt.MQTTClientComponent),
     cv.Optional(CONF_DIAGNOSTIC_SENSORS): cv.ensure_list(DIAGNOSTIC_SENSOR_SCHEMA),
     cv.Optional(CONF_DOWNLINK_COMPOUND_SWITCHES): cv.ensure_list(DOWNLINK_COMPOUND_SWITCH_SCHEMA),
+    cv.Optional(CONF_DOWNLINK_BUTTONS): cv.ensure_list(DOWNLINK_BUTTON_SCHEMA),
+    cv.Optional(CONF_DIAGNOSTIC_BINARY_SENSORS): cv.ensure_list(DIAGNOSTIC_BINARY_SENSOR_SCHEMA),
 })
 
 def _validate_payload_config(config):
@@ -399,6 +434,7 @@ async def to_code(config):
         cg.add(var.add_downlink_switch(
             sw, sw_conf[CONF_CHANNEL], sw_conf[CONF_REPORT_STATE],
             _ha_struct(sw_conf.get(CONF_HA)),
+            sw_conf.get(CONF_HA_DISCOVERY, True),
         ))
 
     # Downlink-controlled numbers (analog_output / u16 / u32 / i16 / i32).
@@ -409,6 +445,7 @@ async def to_code(config):
             num, n_conf[CONF_CHANNEL], ctype, n_conf[CONF_SCALE],
             n_conf[CONF_REPORT_STATE],
             _ha_struct(n_conf.get(CONF_HA)),
+            n_conf.get(CONF_HA_DISCOVERY, True),
         ))
 
     # MQTT discovery configuration — wires up the publish_discovery() action.
@@ -448,6 +485,40 @@ async def to_code(config):
                 ("ha",                      _ha_struct(c_conf.get(CONF_HA))),
             )
             cg.add(var.add_compound_switch(entry))
+
+        # Buttons — one-shot downlinks, no state sync.
+        for b_conf in d_conf.get(CONF_DOWNLINK_BUTTONS, []):
+            slug = _slugify(b_conf[CONF_NAME])
+            include_channels = b_conf.get(CONF_INCLUDE_NUMBER_CHANNELS, [])
+            include_expr = cg.RawExpression(
+                "std::vector<uint8_t>{"
+                + ", ".join(str(ch) for ch in include_channels)
+                + "}"
+            )
+            entry = cg.StructInitializer(
+                DownlinkButtonEntry,
+                ("slug",                    slug),
+                ("name",                    b_conf[CONF_NAME]),
+                ("static_bytes",            _compound_lpp_bytes_expr(b_conf[CONF_WHEN_PRESSED])),
+                ("include_number_channels", include_expr),
+                ("fport",                   b_conf[CONF_FPORT]),
+                ("ha",                      _ha_struct(b_conf.get(CONF_HA))),
+            )
+            cg.add(var.add_downlink_button(entry))
+
+        # Diagnostic binary sensors — state from uplink JSON, not LPP payload.
+        for bs_conf in d_conf.get(CONF_DIAGNOSTIC_BINARY_SENSORS, []):
+            slug = _slugify(bs_conf[CONF_NAME])
+            entry = cg.StructInitializer(
+                DiagnosticBinarySensorEntry,
+                ("slug",            slug),
+                ("name",            bs_conf[CONF_NAME]),
+                ("value_template",  bs_conf[CONF_VALUE_TEMPLATE]),
+                ("device_class",    bs_conf.get(CONF_DEVICE_CLASS, "")),
+                ("icon",            bs_conf.get(CONF_ICON, "")),
+                ("entity_category", bs_conf.get(CONF_ENTITY_CATEGORY, "")),
+            )
+            cg.add(var.add_diagnostic_binary_sensor(entry))
 
         # Diagnostic sensors — pulled from the uplink event JSON itself.
         for diag in d_conf.get(CONF_DIAGNOSTIC_SENSORS, []):

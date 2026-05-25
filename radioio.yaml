@@ -156,15 +156,6 @@ sensor:
     update_interval: 60s
 
 switch:
-  - platform: template
-    name: "LoRa Test Switch"
-    id: lora_test_switch
-    optimistic: true       # state flips locally when turn_on/turn_off is called
-    turn_on_action:
-      - logger.log: "LoRa downlink: switch ON"
-    turn_off_action:
-      - logger.log: "LoRa downlink: switch OFF"
-
   # WiFi master switch. Turning ON also blocks deep sleep so OTA/HA stay reachable.
   # Default ON — device boots reachable; flip OFF to enter battery mode.
   # We also stop/start the MQTT client in lockstep with WiFi so ESP-IDF's MQTT
@@ -269,26 +260,38 @@ lorawan:
     chirpstack_app_id: ${app_id}
     device_name: "LoRaWAN ${dev_eui}"
 
-    # Compound switches — one HA toggle = one ChirpStack downlink that sets
-    # multiple device states at once.  Faster mode change than toggling each
-    # individual switch in sequence (which would queue two separate downlinks).
-    downlink_compound_switches:
+    # Buttons — fire-and-forget downlinks.  No state sync; the binary sensors
+    # below show the actual device state read from the uplink echo.
+    downlink_buttons:
       - name: "LoRaWAN mode"
-        # Online: WiFi on, deep-sleep off
-        when_on:
-          - { channel: 11, value: true }   # ch11 = wifi_enabled
-          - { channel: 12, value: false }  # ch12 = deep_sleep_enabled
-        # Battery: WiFi off, deep-sleep on
-        when_off:
-          - { channel: 11, value: false }
-          - { channel: 12, value: true }
-        # Also bundle the current sleep duration (ch13) so all three settings
-        # land in one ChirpStack downlink — no second queue item needed.
-        include_number_channels: [13]
+        # WiFi off, deep-sleep on + current sleep duration — all in one downlink.
+        when_pressed:
+          - { channel: 11, value: false }  # ch11 = wifi_enabled → OFF
+          - { channel: 12, value: true }   # ch12 = deep_sleep_enabled → ON
+        include_number_channels: [13]      # bundle current sleep_duration_s
         fport: 11
-        state_from_channel: 11             # use WiFi state echo as the toggle state
         ha:
           icon: "mdi:satellite-uplink"
+      - name: "WiFi Online mode"
+        # WiFi on, deep-sleep off — device stays awake and reachable.
+        when_pressed:
+          - { channel: 11, value: true }   # ch11 = wifi_enabled → ON
+          - { channel: 12, value: false }  # ch12 = deep_sleep_enabled → OFF
+        fport: 11
+        ha:
+          icon: "mdi:wifi"
+
+    # Binary sensors — read-only state display driven by the uplink echo.
+    # ch11_digital_input and ch12_digital_input are echoed in every uplink
+    # when report_state: true is set on the corresponding downlink_switch.
+    diagnostic_binary_sensors:
+      - name: "WiFi enabled"
+        value_template: "{{ 'ON' if value_json.object.ch11_digital_input == 1 else 'OFF' }}"
+        device_class: connectivity
+        icon: "mdi:wifi"
+      - name: "Deep sleep enabled"
+        value_template: "{{ 'ON' if value_json.object.ch12_digital_input == 1 else 'OFF' }}"
+        icon: "mdi:power-sleep"
 
     # Diagnostic sensors pulled out of the uplink event JSON itself.
     # value_template is HA Jinja2 evaluated against `value_json` on each uplink.
@@ -321,27 +324,21 @@ lorawan:
       type: illuminance
       # inherits from the tcs34725 sensor definition
 
+  # downlink_switches: these channels are processed on the device but no HA
+  # switch entity is published — buttons + binary sensors handle the HA side.
   downlink_switches:
-    - switch: lora_test_switch
-      channel: 10           # [0x0A 0x01 <0|1>]
-      report_state: true    # echo state in uplink as digital_input on ch 10
     - switch: wifi_enabled
       channel: 11
-      report_state: true
-      ha:
-        name: "WiFi enabled"
-        icon: "mdi:wifi"
+      report_state: true    # echoed as ch11_digital_input in every uplink
+      ha_discovery: false   # no HA switch entity — use buttons instead
     - switch: deep_sleep_enabled
       channel: 12
-      report_state: true
-      ha:
-        name: "Deep sleep enabled"
-        icon: "mdi:power-sleep"
+      report_state: true    # echoed as ch12_digital_input in every uplink
+      ha_discovery: false
 
   downlink_numbers:
     - number: sleep_duration_s
       channel: 13
       type: u16             # [0x0D 0xF0 <hi> <lo>], 0..65535 seconds (~18 h)
       report_state: true    # echo current value back in uplink as ch13_u16
-      ha:
-        name: "Sleep duration"
+      ha_discovery: false   # settable via HA API; buttons bundle it in downlinks

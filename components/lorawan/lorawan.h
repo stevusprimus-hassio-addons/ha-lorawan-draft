@@ -91,11 +91,13 @@ struct CayenneSensorEntry {
 // the matching switch is driven on/off from the main loop.
 // If report_state is true, the switch's current state is echoed in every
 // uplink as a CayenneLPP digital_input on the same channel.
+// ha_discovery=false suppresses HA MQTT discovery while keeping downlink processing.
 struct DownlinkSwitchEntry {
   switch_::Switch *sw;
   uint8_t channel;
   bool report_state;
   HaOverrides ha;
+  bool ha_discovery{true};
 };
 
 // Downlink mapping for numeric fields (analog_output, u16/u32/i16/i32).
@@ -103,6 +105,7 @@ struct DownlinkSwitchEntry {
 // number entity, so e.g. wire 5 with scale 60 → number state 300.
 // If report_state is true, the number's current state is echoed in every
 // uplink using the configured `type` on the same channel.
+// ha_discovery=false suppresses HA MQTT discovery while keeping downlink processing.
 struct DownlinkNumberEntry {
   number::Number *num;
   uint8_t channel;
@@ -110,6 +113,7 @@ struct DownlinkNumberEntry {
   float scale;
   bool report_state;
   HaOverrides ha;
+  bool ha_discovery{true};
 };
 
 // Extra MQTT sensor whose state is pulled out of the ChirpStack uplink JSON
@@ -145,6 +149,31 @@ struct CompoundSwitchEntry {
   int fport;
   int state_from_channel;
   HaOverrides ha;
+};
+
+// Downlink button: one HA MQTT button that fires a SINGLE downlink.
+// static_bytes hold the LPP fields baked at codegen time from `when_pressed`.
+// include_number_channels lets publish_discovery() append current number values
+// so all settings travel in one ChirpStack queue item.
+struct DownlinkButtonEntry {
+  std::string slug;
+  std::string name;
+  std::vector<uint8_t> static_bytes;
+  std::vector<uint8_t> include_number_channels;
+  int fport;
+  HaOverrides ha;
+};
+
+// Binary sensor whose state is derived from the ChirpStack uplink JSON itself
+// via a Jinja2 value_template that evaluates to "ON" or "OFF".
+// Published under homeassistant/binary_sensor/ by publish_discovery().
+struct DiagnosticBinarySensorEntry {
+  std::string slug;
+  std::string name;
+  std::string value_template;
+  std::string device_class;
+  std::string icon;
+  std::string entity_category;
 };
 
 // FreeRTOS queue payloads — pushed by the background task, consumed by loop().
@@ -196,11 +225,15 @@ class LoRaWANComponent : public Component {
   void add_cayenne_sensor(sensor::Sensor *sensor, uint8_t channel, CayenneType type, float scale,
                           const HaOverrides &ha = {});
   void add_downlink_switch(switch_::Switch *sw, uint8_t channel,
-                           bool report_state = false, const HaOverrides &ha = {});
+                           bool report_state = false, const HaOverrides &ha = {},
+                           bool ha_discovery = true);
   void add_downlink_number(number::Number *num, uint8_t channel, CayenneType type, float scale,
-                           bool report_state = false, const HaOverrides &ha = {});
+                           bool report_state = false, const HaOverrides &ha = {},
+                           bool ha_discovery = true);
   void add_diagnostic_sensor(const DiagnosticSensorEntry &entry);
   void add_compound_switch(const CompoundSwitchEntry &entry);
+  void add_downlink_button(const DownlinkButtonEntry &entry);
+  void add_diagnostic_binary_sensor(const DiagnosticBinarySensorEntry &entry);
   void set_payload_lambda(const std::function<std::vector<uint8_t>()> &lambda);
 
  protected:
@@ -227,6 +260,8 @@ class LoRaWANComponent : public Component {
   std::vector<DownlinkNumberEntry> downlink_numbers_;
   std::vector<DiagnosticSensorEntry> diagnostic_sensors_;
   std::vector<CompoundSwitchEntry> compound_switches_;
+  std::vector<DownlinkButtonEntry> downlink_buttons_;
+  std::vector<DiagnosticBinarySensorEntry> diagnostic_binary_sensors_;
   optional<std::function<std::vector<uint8_t>()>> payload_lambda_;
 
   // Dedicated VSPI instance — keeps LoRaWAN SPI isolated from the global
