@@ -62,6 +62,11 @@ esphome:
             - lambda: 'id(mqtt_client).disable();'
             - wifi.disable:
 
+      # Apply the restored/initial sleep duration to the deep_sleep component.
+      # set_action does not fire on initial_value or NVS restore, so we push
+      # the current number state manually on every boot.
+      - lambda: 'id(ds).set_sleep_duration((uint32_t) id(sleep_duration_s).state * 1000UL);'
+
       # Wait for sensors to produce their first reading, then uplink.
       - delay: 10s
       - lorawan.send:
@@ -161,7 +166,7 @@ switch:
   # We also stop/start the MQTT client in lockstep with WiFi so ESP-IDF's MQTT
   # subsystem doesn't spam ERROR logs trying to reconnect over a dead link.
   - platform: template
-    name: "WiFi enabled"
+    name: "WiFi"
     id: wifi_enabled
     optimistic: true
     restore_mode: RESTORE_DEFAULT_ON
@@ -185,7 +190,7 @@ switch:
   # of WiFi state — useful for staying online during diagnostics or OTA.
   # Default OFF — device stays awake until you explicitly enable sleep.
   - platform: template
-    name: "Deep sleep enabled"
+    name: "Deep Sleep"
     id: deep_sleep_enabled
     optimistic: true
     restore_mode: RESTORE_DEFAULT_OFF
@@ -271,7 +276,7 @@ lorawan:
         include_number_channels: [13]      # bundle current sleep_duration_s
         fport: 11
         ha:
-          icon: "mdi:satellite-uplink"
+          icon: "mdi:access-point"
       - name: "WiFi Online mode"
         # WiFi on, deep-sleep off — device stays awake and reachable.
         when_pressed:
@@ -285,11 +290,11 @@ lorawan:
     # ch11_digital_input and ch12_digital_input are echoed in every uplink
     # when report_state: true is set on the corresponding downlink_switch.
     diagnostic_binary_sensors:
-      - name: "WiFi enabled"
+      - name: "WiFi"
         value_template: "{{ 'ON' if value_json.object.ch11_digital_input == 1 else 'OFF' }}"
         device_class: connectivity
         icon: "mdi:wifi"
-      - name: "Deep sleep enabled"
+      - name: "Deep sleep"
         value_template: "{{ 'ON' if value_json.object.ch12_digital_input == 1 else 'OFF' }}"
         icon: "mdi:power-sleep"
 
@@ -304,6 +309,7 @@ lorawan:
         unit_of_measurement: dBm
         device_class: signal_strength
         state_class: measurement
+        icon: "mdi:access-point"
 
   cayenne_sensors:
     - sensor: device_uptime
@@ -341,4 +347,4 @@ lorawan:
       channel: 13
       type: u16             # [0x0D 0xF0 <hi> <lo>], 0..65535 seconds (~18 h)
       report_state: true    # echo current value back in uplink as ch13_u16
-      ha_discovery: false   # settable via HA API; buttons bundle it in downlinks
+      ha_discovery: true   # settable via HA API; buttons bundle it in downlinks

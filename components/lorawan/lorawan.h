@@ -281,6 +281,9 @@ class LoRaWANComponent : public Component {
   QueueHandle_t pending_switch_queue_{nullptr};
   QueueHandle_t pending_number_queue_{nullptr};
   std::atomic<bool> ready_{false};
+  // Set by lora_task_loop_() after every downlink; cleared by loop() which then
+  // calls send_now() to keep the exchange going until no further downlink arrives.
+  std::atomic<bool> follow_up_uplink_{false};
 
   // MQTT discovery state — set only when mqtt_discovery is configured in YAML.
   // publish_discovery() is a no-op unless mqtt_client_ and chirpstack_app_id_

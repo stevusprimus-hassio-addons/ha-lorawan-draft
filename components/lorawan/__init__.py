@@ -266,12 +266,13 @@ DOWNLINK_BUTTON_SCHEMA = cv.Schema({
 
 # Binary sensor derived from the ChirpStack uplink JSON.
 # value_template must evaluate to "ON" or "OFF".
+# Defaults to entity_category: diagnostic so HA places them under Diagnostics.
 DIAGNOSTIC_BINARY_SENSOR_SCHEMA = cv.Schema({
     cv.Required(CONF_NAME):            cv.string,
     cv.Required(CONF_VALUE_TEMPLATE):  cv.string,
     cv.Optional(CONF_DEVICE_CLASS):    cv.string,
     cv.Optional(CONF_ICON):            cv.icon,
-    cv.Optional(CONF_ENTITY_CATEGORY, default=""): cv.string,
+    cv.Optional(CONF_ENTITY_CATEGORY, default="diagnostic"): cv.string,
 })
 
 

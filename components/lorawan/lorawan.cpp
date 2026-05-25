@@ -184,11 +184,15 @@ void LoRaWANComponent::lora_task_loop_() {
                                    dl_buf, &dl_len);
 
     if (state > 0) {
-      ESP_LOGI(TAG, "Uplink OK, downlink received on port %d (%u bytes)",
+      ESP_LOGI(TAG, "Uplink OK, downlink received on port %d (%u bytes) — will follow up",
                state, (unsigned) dl_len);
       handle_downlink_(dl_buf, dl_len);
+      // Tell loop() to queue another uplink once switch/number actions have been
+      // applied.  That uplink's RX window may carry another downlink, continuing
+      // the exchange until the server has no more to send.
+      follow_up_uplink_.store(true, std::memory_order_release);
     } else if (state == RADIOLIB_ERR_NONE) {
-      ESP_LOGI(TAG, "Uplink OK");
+      ESP_LOGI(TAG, "Uplink OK, no downlink");
     } else {
       LOG_RL_ERR("Uplink", state);
     }
@@ -330,6 +334,15 @@ void LoRaWANComponent::loop() {
       call.set_value(action.value);
       call.perform();
     }
+  }
+
+  // Follow-up uplink: if the last cycle had a downlink, send another so the
+  // server can push further commands.  Switch/number state changes above are
+  // committed first, so the follow-up payload reflects the new device state.
+  // The loop stops as soon as a cycle comes back with no downlink.
+  if (follow_up_uplink_.exchange(false, std::memory_order_acq_rel)) {
+    ESP_LOGI(TAG, "Downlink processed — sending follow-up uplink");
+    send_now();
   }
 }
 
