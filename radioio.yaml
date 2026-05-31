@@ -181,6 +181,75 @@ mqtt:
   reboot_timeout: 0s
 
 sensor:
+  - platform: adc
+    pin: GPIO35
+    name: "Battery Voltage"
+    id: battery_voltage
+    attenuation: 12db
+    samples: 16
+    update_interval: 30s
+    unit_of_measurement: V
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+    filters:
+      # 100k/100k divider halves the battery voltage at the ADC pin.
+      - multiply: 2.0
+  - platform: adc
+    pin: GPIO36
+    name: "Rain Sensor Voltage"
+    id: rain_sensor_voltage
+    attenuation: 12db
+    samples: 16
+    update_interval: 30s
+    unit_of_measurement: V
+    accuracy_decimals: 2
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    name: "Battery"
+    id: battery_percentage
+    update_interval: 30s
+    unit_of_measurement: "%"
+    accuracy_decimals: 0
+    device_class: battery
+    state_class: measurement
+    lambda: |-
+      if (isnan(id(battery_voltage).state)) {
+        return NAN;
+      }
+      const float percent = (id(battery_voltage).state - 3.0f) * 100.0f / (4.2f - 3.0f);
+      return clamp(percent, 0.0f, 100.0f);
+  - platform: template
+    name: "Motion State"
+    id: motion_state
+    internal: true
+    update_interval: 1s
+    lambda: |-
+      return id(motion).state ? 1.0f : 0.0f;
+  - platform: template
+    name: "Rain State"
+    id: rain_state
+    internal: true
+    update_interval: 1s
+    lambda: |-
+      return id(rain_detected).state ? 1.0f : 0.0f;
+  - platform: aht10
+    variant: AHT20
+    address: 0x38
+    temperature:
+      name: "AHT20 Temperature"
+      id: aht20_temperature
+    humidity:
+      name: "AHT20 Humidity"
+      id: aht20_humidity
+    update_interval: 60s
+  - platform: bmp280_i2c
+    address: 0x77
+    pressure:
+      name: "BMP280 Pressure"
+      id: bmp280_pressure
+    update_interval: 60s
   - platform: wifi_signal
     name: "WiFi RSSI"
     id: wifi_rssi
@@ -213,6 +282,29 @@ sensor:
     glass_attenuation_factor: 1.0
     address: 0x29
     update_interval: 60s
+
+binary_sensor:
+  - platform: template
+    name: "Charging"
+    id: battery_charging
+    device_class: battery_charging
+    lambda: |-
+      if (isnan(id(battery_voltage).state)) {
+        return {};
+      }
+      return id(battery_voltage).state > 4.2f;
+  - platform: gpio
+    pin: GPIO34
+    name: "Motion"
+    id: motion
+    device_class: motion
+  - platform: gpio
+    pin:
+      number: GPIO25
+      inverted: true
+    name: "Rain"
+    id: rain_detected
+    device_class: moisture
 
 switch:
   # WiFi master switch. Turning ON also blocks deep sleep so OTA/HA stay reachable.
@@ -351,6 +443,15 @@ lorawan:
       - name: "Deep sleep"
         value_template: "{{ 'ON' if value_json.object.ch12_digital_input == 1 else 'OFF' }}"
         icon: "mdi:power-sleep"
+      - name: "Charging"
+        value_template: "{{ 'ON' if value_json.object.ch4_voltage | float > 4.2 else 'OFF' }}"
+        device_class: battery_charging
+      - name: "Motion"
+        value_template: "{{ 'ON' if value_json.object.ch6_digital_input == 1 else 'OFF' }}"
+        device_class: motion
+      - name: "Rain"
+        value_template: "{{ 'ON' if value_json.object.ch14_digital_input == 1 else 'OFF' }}"
+        device_class: moisture
 
     # Diagnostic sensors pulled out of the uplink event JSON itself.
     # value_template is HA Jinja2 evaluated against `value_json` on each uplink.
@@ -383,6 +484,39 @@ lorawan:
       channel: 3
       type: illuminance
       # inherits from the tcs34725 sensor definition
+    - sensor: battery_voltage
+      channel: 4
+      type: voltage
+      # 100k/100k divider correction is applied in the ADC sensor above
+    - sensor: battery_percentage
+      channel: 5
+      type: analog_input
+      ha:
+        name: "Battery"
+        unit_of_measurement: "%"
+        device_class: battery
+        state_class: measurement
+    - sensor: motion_state
+      channel: 6
+      type: digital_input
+      ha:
+        name: "Motion State"
+        entity_category: diagnostic
+    - sensor: aht20_temperature
+      channel: 7
+      type: temperature
+    - sensor: aht20_humidity
+      channel: 8
+      type: humidity
+    - sensor: bmp280_pressure
+      channel: 9
+      type: barometer
+    - sensor: rain_state
+      channel: 14
+      type: digital_input
+      ha:
+        name: "Rain State"
+        entity_category: diagnostic
 
   # downlink_switches: these channels are processed on the device but no HA
   # switch entity is published — buttons + binary sensors handle the HA side.
