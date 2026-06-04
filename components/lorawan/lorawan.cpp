@@ -97,6 +97,11 @@ void LoRaWANComponent::setup() {
     return;
   }
 
+  state = radio_->setOutputPower(14);
+  if (state != RADIOLIB_ERR_NONE) {
+    LOG_RL_ERR("setOutputPower", state);
+  }
+
   // setRfSwitchPins must be called AFTER begin() in RadioLib 7.x
   radio_->setRfSwitchPins(rxen_pin_, txen_pin_);
 
@@ -391,7 +396,11 @@ void LoRaWANComponent::add_downlink_button(const DownlinkButtonEntry &entry) {
   downlink_buttons_.push_back(entry);
 }
 
-void LoRaWANComponent::add_diagnostic_binary_sensor(const DiagnosticBinarySensorEntry &entry) {
+void LoRaWANComponent::add_binary_sensor(const BinarySensorEntry &entry) {
+  binary_sensors_.push_back(entry);
+}
+
+void LoRaWANComponent::add_diagnostic_binary_sensor(const BinarySensorEntry &entry) {
   diagnostic_binary_sensors_.push_back(entry);
 }
 
@@ -1135,6 +1144,27 @@ void LoRaWANComponent::publish_discovery() {
     ESP_LOGI(TAG, "Discovery: button '%s' (fport=%d)", name.c_str(), e.fport);
   }
 
+  // ---------- Binary sensors ------------------------------------------------
+  // Read-only state indicators driven by value_template on the uplink topic.
+  // value_template must evaluate to "ON" or "OFF".
+  for (const auto &e : binary_sensors_) {
+    const std::string uid   = device_id + "_bin_" + e.slug;
+    const std::string topic = discovery_prefix_ + "/binary_sensor/" + device_id + "/bin_" + e.slug + "/config";
+
+    std::string payload = "{\"name\":\"" + json_escape(e.name) + "\"";
+    payload += ",\"unique_id\":\"" + uid + "\"";
+    payload += ",\"state_topic\":\"" + uplink_topic + "\"";
+    payload += ",\"value_template\":\"" + json_escape(e.value_template) + "\"";
+    json_append_str(payload, "device_class",    e.device_class);
+    json_append_str(payload, "icon",            e.icon);
+    json_append_str(payload, "entity_category", e.entity_category);
+    payload += device_block;
+    payload += "}";
+
+    mqtt_client_->publish(topic, payload, 0, true);
+    ESP_LOGI(TAG, "Discovery: binary sensor '%s' → %s", e.name.c_str(), e.slug.c_str());
+  }
+
   // ---------- Diagnostic binary sensors ------------------------------------
   // Read-only state indicators driven by value_template on the uplink topic.
   // value_template must evaluate to "ON" or "OFF".
@@ -1190,7 +1220,7 @@ void LoRaWANComponent::publish_discovery() {
            (unsigned) compound_switches_.size(),
            (unsigned) num_count,
            (unsigned) downlink_buttons_.size(),
-           (unsigned) diagnostic_binary_sensors_.size(),
+           (unsigned) (binary_sensors_.size() + diagnostic_binary_sensors_.size()),
            (unsigned) diagnostic_sensors_.size());
 }
 

@@ -18,7 +18,7 @@ HaOverrides                  = lorawan_ns.struct("HaOverrides")
 DiagnosticSensorEntry        = lorawan_ns.struct("DiagnosticSensorEntry")
 CompoundSwitchEntry          = lorawan_ns.struct("CompoundSwitchEntry")
 DownlinkButtonEntry          = lorawan_ns.struct("DownlinkButtonEntry")
-DiagnosticBinarySensorEntry  = lorawan_ns.struct("DiagnosticBinarySensorEntry")
+BinarySensorEntry            = lorawan_ns.struct("BinarySensorEntry")
 
 
 def _slugify(name: str) -> str:
@@ -118,6 +118,7 @@ CONF_INCLUDE_NUMBER_CHANNELS    = "include_number_channels"
 CONF_HA_DISCOVERY               = "ha_discovery"
 CONF_DOWNLINK_BUTTONS           = "downlink_buttons"
 CONF_WHEN_PRESSED               = "when_pressed"
+CONF_BINARY_SENSORS             = "binary_sensors"
 CONF_DIAGNOSTIC_BINARY_SENSORS  = "diagnostic_binary_sensors"
 
 HA_OVERRIDES_SCHEMA = cv.Schema({
@@ -264,6 +265,14 @@ DOWNLINK_BUTTON_SCHEMA = cv.Schema({
     cv.Optional(CONF_HA): HA_OVERRIDES_SCHEMA,
 })
 
+BINARY_SENSOR_SCHEMA = cv.Schema({
+    cv.Required(CONF_NAME):            cv.string,
+    cv.Required(CONF_VALUE_TEMPLATE):  cv.string,
+    cv.Optional(CONF_DEVICE_CLASS):    cv.string,
+    cv.Optional(CONF_ICON):            cv.icon,
+    cv.Optional(CONF_ENTITY_CATEGORY): cv.string,
+})
+
 # Binary sensor derived from the ChirpStack uplink JSON.
 # value_template must evaluate to "ON" or "OFF".
 # Defaults to entity_category: diagnostic so HA places them under Diagnostics.
@@ -312,6 +321,7 @@ MQTT_DISCOVERY_SCHEMA = cv.Schema({
     cv.Optional(CONF_DIAGNOSTIC_SENSORS): cv.ensure_list(DIAGNOSTIC_SENSOR_SCHEMA),
     cv.Optional(CONF_DOWNLINK_COMPOUND_SWITCHES): cv.ensure_list(DOWNLINK_COMPOUND_SWITCH_SCHEMA),
     cv.Optional(CONF_DOWNLINK_BUTTONS): cv.ensure_list(DOWNLINK_BUTTON_SCHEMA),
+    cv.Optional(CONF_BINARY_SENSORS): cv.ensure_list(BINARY_SENSOR_SCHEMA),
     cv.Optional(CONF_DIAGNOSTIC_BINARY_SENSORS): cv.ensure_list(DIAGNOSTIC_BINARY_SENSOR_SCHEMA),
 })
 
@@ -507,11 +517,25 @@ async def to_code(config):
             )
             cg.add(var.add_downlink_button(entry))
 
+        # Normal binary sensors — state from uplink JSON, not LPP payload.
+        for bs_conf in d_conf.get(CONF_BINARY_SENSORS, []):
+            slug = _slugify(bs_conf[CONF_NAME])
+            entry = cg.StructInitializer(
+                BinarySensorEntry,
+                ("slug",            slug),
+                ("name",            bs_conf[CONF_NAME]),
+                ("value_template",  bs_conf[CONF_VALUE_TEMPLATE]),
+                ("device_class",    bs_conf.get(CONF_DEVICE_CLASS, "")),
+                ("icon",            bs_conf.get(CONF_ICON, "")),
+                ("entity_category", bs_conf.get(CONF_ENTITY_CATEGORY, "")),
+            )
+            cg.add(var.add_binary_sensor(entry))
+
         # Diagnostic binary sensors — state from uplink JSON, not LPP payload.
         for bs_conf in d_conf.get(CONF_DIAGNOSTIC_BINARY_SENSORS, []):
             slug = _slugify(bs_conf[CONF_NAME])
             entry = cg.StructInitializer(
-                DiagnosticBinarySensorEntry,
+                BinarySensorEntry,
                 ("slug",            slug),
                 ("name",            bs_conf[CONF_NAME]),
                 ("value_template",  bs_conf[CONF_VALUE_TEMPLATE]),

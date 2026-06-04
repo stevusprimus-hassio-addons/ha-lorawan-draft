@@ -73,39 +73,43 @@ esphome:
                          id(deep_sleep_enabled).state ? "ON" : "OFF");
             - if:
                 condition:
+                  switch.is_on: wifi_enabled
+                then:
+                  # WiFi is disabled by default at component boot, so it never
+                  # briefly connects during LoRaWAN-only wake cycles.  If the
+                  # restored mode wants WiFi, bring it up deliberately here.
+                  - logger.log: "on_boot: wifi_enabled=ON → starting WiFi"
+                  - wifi.enable:
+                  - deep_sleep.prevent: ds
+                  - lambda: 'id(mqtt_client).enable();'
+
+                  # Discovery is retained and idempotent, so publishing on
+                  # WiFi boots is enough.  LoRaWAN-only boots skip this wait.
+                  - logger.log: "on_boot: waiting up to 15s for MQTT to publish discovery"
+                  - wait_until:
+                      condition:
+                        mqtt.connected:
+                      timeout: 15s
+                  - if:
+                      condition:
+                        mqtt.connected:
+                      then:
+                        - logger.log: "on_boot: MQTT connected — publishing discovery"
+                        - lorawan.publish_discovery:
+                        - delay: 1s         # let publishes flush before we maybe sleep
+                      else:
+                        - logger.log: "on_boot: MQTT timed out — discovery skipped this cycle"
+                else:
+                  # Keep MQTT explicitly stopped in LoRaWAN mode so it does not
+                  # try to reconnect over a disabled WiFi interface.
+                  - logger.log: "on_boot: wifi_enabled=OFF → staying in LoRaWAN mode"
+                  - lambda: 'id(mqtt_client).disable();'
+
+            - if:
+                condition:
                   switch.is_off: deep_sleep_enabled
                 then:
                   - deep_sleep.prevent: ds
-
-            # Try to publish HA MQTT discovery on EVERY boot, regardless of
-            # wifi_enabled — discovery is retained on the broker and idempotent.
-            # We wait briefly for MQTT to come up; if it doesn't, we skip and the
-            # already-retained discovery on the broker keeps HA happy.
-            - logger.log: "on_boot: waiting up to 15s for MQTT to publish discovery"
-            - wait_until:
-                condition:
-                  mqtt.connected:
-                timeout: 15s
-            - if:
-                condition:
-                  mqtt.connected:
-                then:
-                  - logger.log: "on_boot: MQTT connected — publishing discovery"
-                  - lorawan.publish_discovery:
-                  - delay: 1s         # let publishes flush before we maybe disable WiFi
-                else:
-                  - logger.log: "on_boot: MQTT timed out — discovery skipped this cycle"
-
-            # NOW honour wifi_enabled for the rest of this wake cycle.
-            # Stop MQTT before tearing down WiFi so ESP-IDF doesn't log socket-abort
-            # errors for the few seconds between WiFi-down and MQTT noticing.
-            - if:
-                condition:
-                  switch.is_off: wifi_enabled
-                then:
-                  - logger.log: "on_boot: wifi_enabled=OFF → entering battery mode"
-                  - lambda: 'id(mqtt_client).disable();'
-                  - wifi.disable:
 
             # Apply the restored/initial sleep duration to the deep_sleep component.
             # set_action does not fire on initial_value or NVS restore, so we push
@@ -148,6 +152,9 @@ ota:
     password: !secret ota_password
 
 wifi:
+  # Start WiFi only when the restored WiFi mode says so. This avoids a short
+  # API/MQTT reconnect on every LoRaWAN-only wake.
+  enable_on_boot: false
 
   networks:
     - ssid: !secret wifi_ssid
@@ -173,6 +180,7 @@ mqtt:
   broker: !secret mqtt_broker
   username: !secret mqtt_user
   password: !secret mqtt_password
+  enable_on_boot: false
   # Don't auto-publish HA discovery for the ESP's own entities — they're
   # already exposed via api:.  We only use this mqtt client to publish our
   # explicit button-discovery messages and LoRaWAN downlink commands.
@@ -355,7 +363,7 @@ number:
   - platform: template
     name: "Sleep duration (s)"
     id: sleep_duration_s
-    min_value: 60
+    min_value: 20
     max_value: 65535
     step: 1
     initial_value: 60
@@ -383,7 +391,7 @@ deep_sleep:
 # When deep sleep is ON the device wakes, on_boot fires lorawan.send, sleeps —
 # this interval rarely gets a chance to run in that mode, and that's fine.
 interval:
-  - interval: 60s
+  - interval: 30s
     then:
       - lorawan.send:
 
@@ -443,6 +451,8 @@ lorawan:
       - name: "Deep sleep"
         value_template: "{{ 'ON' if value_json.object.ch12_digital_input == 1 else 'OFF' }}"
         icon: "mdi:power-sleep"
+
+    binary_sensors:
       - name: "Charging"
         value_template: "{{ 'ON' if value_json.object.ch4_voltage | float > 4.2 else 'OFF' }}"
         device_class: battery_charging
@@ -501,7 +511,6 @@ lorawan:
       type: digital_input
       ha:
         name: "Motion State"
-        entity_category: diagnostic
     - sensor: aht20_temperature
       channel: 7
       type: temperature
@@ -516,7 +525,6 @@ lorawan:
       type: digital_input
       ha:
         name: "Rain State"
-        entity_category: diagnostic
 
   # downlink_switches: these channels are processed on the device but no HA
   # switch entity is published — buttons + binary sensors handle the HA side.

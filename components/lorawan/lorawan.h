@@ -167,7 +167,7 @@ struct DownlinkButtonEntry {
 // Binary sensor whose state is derived from the ChirpStack uplink JSON itself
 // via a Jinja2 value_template that evaluates to "ON" or "OFF".
 // Published under homeassistant/binary_sensor/ by publish_discovery().
-struct DiagnosticBinarySensorEntry {
+struct BinarySensorEntry {
   std::string slug;
   std::string name;
   std::string value_template;
@@ -233,7 +233,8 @@ class LoRaWANComponent : public Component {
   void add_diagnostic_sensor(const DiagnosticSensorEntry &entry);
   void add_compound_switch(const CompoundSwitchEntry &entry);
   void add_downlink_button(const DownlinkButtonEntry &entry);
-  void add_diagnostic_binary_sensor(const DiagnosticBinarySensorEntry &entry);
+  void add_binary_sensor(const BinarySensorEntry &entry);
+  void add_diagnostic_binary_sensor(const BinarySensorEntry &entry);
   void set_payload_lambda(const std::function<std::vector<uint8_t>()> &lambda);
 
  protected:
@@ -261,7 +262,8 @@ class LoRaWANComponent : public Component {
   std::vector<DiagnosticSensorEntry> diagnostic_sensors_;
   std::vector<CompoundSwitchEntry> compound_switches_;
   std::vector<DownlinkButtonEntry> downlink_buttons_;
-  std::vector<DiagnosticBinarySensorEntry> diagnostic_binary_sensors_;
+  std::vector<BinarySensorEntry> binary_sensors_;
+  std::vector<BinarySensorEntry> diagnostic_binary_sensors_;
   optional<std::function<std::vector<uint8_t>()>> payload_lambda_;
 
   // Dedicated VSPI instance — keeps LoRaWAN SPI isolated from the global
