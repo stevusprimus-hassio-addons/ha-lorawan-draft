@@ -223,8 +223,8 @@ sensor:
     device_class: battery
     state_class: measurement
     lambda: |-
-      if (isnan(id(battery_voltage).state)) {
-        return NAN;
+      if (!id(battery_voltage).has_state() || !isfinite(id(battery_voltage).state)) {
+        return {};
       }
       const float percent = (id(battery_voltage).state - 3.0f) * 100.0f / (4.2f - 3.0f);
       return clamp(percent, 0.0f, 100.0f);
@@ -405,8 +405,10 @@ lorawan:
   dio1_pin: 26
   rst_pin: 14
   busy_pin: 27
-  txen_pin: 32
-  rxen_pin: 33
+  #txen_pin: 32
+  #rxen_pin: 33
+  txen_pin: 33
+  rxen_pin: 32
   join_eui: ${join_eui}
   dev_eui:  ${dev_eui}
   app_key:  ${app_key}
@@ -500,7 +502,7 @@ lorawan:
       # 100k/100k divider correction is applied in the ADC sensor above
     - sensor: battery_percentage
       channel: 5
-      type: analog_input
+      type: percentage
       ha:
         name: "Battery"
         unit_of_measurement: "%"

@@ -3,6 +3,7 @@
 #include <SPI.h>
 #include <Preferences.h>
 #include <CayenneLPP.h>
+#include <cmath>
 
 namespace esphome {
 namespace lorawan {
@@ -429,6 +430,11 @@ std::vector<uint8_t> LoRaWANComponent::build_payload_() {
         continue;
       }
       const float v = entry.sensor->state;
+      if (!std::isfinite(v)) {
+        ESP_LOGD(TAG, "Sensor on channel %u has non-finite state, skipping field", entry.channel);
+        ++skipped;
+        continue;
+      }
       switch (entry.type) {
         // --- Standard CayenneLPP types (scaling fixed by spec) ---
         case CayenneType::ANALOG_INPUT:   lpp.addAnalogInput(entry.channel, v); break;
@@ -563,6 +569,11 @@ std::vector<uint8_t> LoRaWANComponent::build_payload_() {
       continue;
     }
     float raw = entry.sensor->state * entry.scale;
+    if (!std::isfinite(raw)) {
+      ESP_LOGD(TAG, "Sensor has non-finite state, skipping field");
+      ++raw_skipped;
+      continue;
+    }
     switch (entry.encoding) {
       case Encoding::UINT8: {
         if (raw < 0.0f || raw > 255.0f)
